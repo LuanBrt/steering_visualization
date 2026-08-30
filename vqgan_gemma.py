@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import random
 from pathlib import Path
 from typing import List
 
@@ -65,32 +64,35 @@ def total_variation(x: torch.Tensor) -> torch.Tensor:
     return dx.abs().mean() + dy.abs().mean()
 
 
-def random_view(image: torch.Tensor, out_size: int) -> torch.Tensor:
-    _, _, h, w = image.shape
-    scale = random.uniform(0.78, 1.0)
-    crop_h = max(8, int(h * scale))
-    crop_w = max(8, int(w * scale))
-    y0 = random.randint(0, h - crop_h)
-    x0 = random.randint(0, w - crop_w)
-    crop = image[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
-    crop = F.interpolate(crop, size=(out_size, out_size), mode="bilinear", align_corners=False)
-
-    if random.random() < 0.5:
-        crop = crop.flip(-1)
-
-    brightness = random.uniform(0.93, 1.07)
-    contrast = random.uniform(0.93, 1.07)
-    mean = crop.mean(dim=(-2, -1), keepdim=True)
-    crop = (crop - mean) * contrast + mean
-    crop = crop * brightness
-    crop = crop + torch.randn_like(crop) * random.uniform(0.0, 0.018)
-    return clamp_with_grad(crop, 0.0, 1.0)
+DAS_SHIFT = 56
+DAS_NOISE_STD = 0.1
 
 
-def make_views(image: torch.Tensor, n_views: int, out_size: int) -> torch.Tensor:
-    views = [F.interpolate(image, size=(out_size, out_size), mode="bilinear", align_corners=False)]
-    for _ in range(n_views - 1):
-        views.append(random_view(image, out_size))
+def make_views(
+    image: torch.Tensor,
+    n_views: int,
+    out_size: int,
+    shift: int = DAS_SHIFT,
+    noise_std: float = DAS_NOISE_STD,
+) -> torch.Tensor:
+    """The paper's DAS augmentation: independent shifts and pixel noise.
+
+    The image is enlarged by 2*shift and each view takes an independent
+    out_size crop.  This matches the paper's +/-56 pixel translation window
+    and Gaussian noise (std=0.1) at the 448x448 working resolution.
+    """
+    if shift < 0:
+        raise ValueError("shift must be non-negative")
+    enlarged_size = out_size + 2 * shift
+    enlarged = F.interpolate(
+        image, size=(enlarged_size, enlarged_size), mode="bilinear", align_corners=False
+    )
+    views = []
+    for _ in range(n_views):
+        offset_y = int(torch.randint(0, 2 * shift + 1, (), device=image.device).item())
+        offset_x = int(torch.randint(0, 2 * shift + 1, (), device=image.device).item())
+        crop = enlarged[:, :, offset_y:offset_y + out_size, offset_x:offset_x + out_size]
+        views.append(crop + noise_std * torch.randn_like(crop))
     return torch.cat(views, dim=0)
 
 
@@ -215,7 +217,12 @@ class GemmaObjective:
         n_tokens = int(mask[0].sum().item())
         return hidden[mask].view(batch, n_tokens, hidden.shape[-1]).float()
 
-    def representation_loss(self, image: torch.Tensor, tau: float = 0.25) -> tuple[torch.Tensor, dict]:
+    def representation_loss(
+        self,
+        image: torch.Tensor,
+        tau: float = 0.25,
+        spatial_sigma: float = 2.0,
+    ) -> tuple[torch.Tensor, dict]:
         patches = self.image_patch_activations(image)
         centered = patches - self.image_baseline[None, None, :]
         scores = F.cosine_similarity(
@@ -224,12 +231,30 @@ class GemmaObjective:
             dim=-1,
             eps=1e-8,
         )
-        weights = F.softmax(scores / tau, dim=-1)
+        # Match paper_experiment.py: add a centered spatial Gaussian prior
+        # to the patch logits before the temperature softmax.
+        n_patches = centered.shape[1]
+        side = int(round(math.sqrt(n_patches)))
+        if side * side == n_patches:
+            coords = torch.arange(side, device=centered.device, dtype=centered.dtype)
+            yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+            center = (side - 1) / 2.0
+            log_g = -((xx - center).square() + (yy - center).square()) / (
+                2.0 * spatial_sigma * spatial_sigma
+            )
+            log_g = log_g.flatten()
+        else:
+            # Gemma currently produces a square patch grid; retain a safe
+            # fallback for processors that do not.
+            log_g = torch.zeros(n_patches, device=centered.device, dtype=centered.dtype)
+
+        weights = F.softmax((scores + log_g[None, :]) / tau, dim=-1)
         rep = (weights[..., None] * centered).sum(dim=1)
         cosine = F.cosine_similarity(rep, self.text_direction[None, :], dim=-1, eps=1e-8)
         return -cosine.mean(), {
             "rep_cos": cosine.mean().detach(),
             "patch_max": scores.max().detach(),
+            "weight_max": weights.max().detach(),
         }
 
     def sentence_loss(self, image: torch.Tensor) -> tuple[torch.Tensor, dict]:
@@ -349,7 +374,7 @@ class EMA:
 
 def main():
     parser = argparse.ArgumentParser(description="Experimental VQGAN + Gemma concept synthesis")
-    parser.add_argument("--target", default="water")
+    parser.add_argument("--target", default="lion")
     parser.add_argument("--sentence", default="A person")
     parser.add_argument("--objective", choices=["representation", "sentence", "hybrid"], default="representation")
     parser.add_argument("--layer", type=int, default=5)
@@ -366,18 +391,21 @@ def main():
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--views", type=int, default=4)
     parser.add_argument("--tau", type=float, default=0.5)
+    parser.add_argument("--spatial-sigma-start", type=float, default=2.0)
+    parser.add_argument("--spatial-sigma-end", type=float, default=16.0)
+    parser.add_argument("--das-shift", type=int, default=DAS_SHIFT)
+    parser.add_argument("--das-noise-std", type=float, default=DAS_NOISE_STD)
     parser.add_argument("--rep-weight", type=float, default=4.0)
     parser.add_argument("--sentence-weight", type=float, default=0.15)
     parser.add_argument("--commit-weight", type=float, default=0.20)
     parser.add_argument("--tv-weight", type=float, default=0.04)
     parser.add_argument("--latent-l2-weight", type=float, default=0.001)
     parser.add_argument("--ema-decay", type=float, default=0.98)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--out", default="output_vqgan_gemma")
     args = parser.parse_args()
 
-    random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -422,6 +450,8 @@ def main():
     print(f"steps            = {args.steps}")
     print(f"lr               = {args.lr}")
     print(f"views            = {args.views}")
+    print(f"spatial sigma    = {args.spatial_sigma_start} -> {args.spatial_sigma_end}")
+    print(f"DAS shift/noise  = +/-{args.das_shift} / {args.das_noise_std}")
     print(f"rep weight       = {args.rep_weight}")
     print(f"sentence weight  = {args.sentence_weight}")
     print(f"commit weight    = {args.commit_weight}")
@@ -432,16 +462,33 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         image, commit_loss = generator.decode()
-        views = make_views(image, args.views, gemma.model_image_h)
+        views = make_views(
+            image,
+            args.views,
+            gemma.model_image_h,
+            shift=args.das_shift,
+            noise_std=args.das_noise_std,
+        )
         views = views.to(gemma.device)
+
+        progress = step / max(args.steps - 1, 1)
+        spatial_sigma = args.spatial_sigma_start + progress * (
+            args.spatial_sigma_end - args.spatial_sigma_start
+        )
 
         rep_loss = torch.zeros((), device=gemma.device)
         sentence_loss = torch.zeros((), device=gemma.device)
-        rep_diag = {"rep_cos": torch.tensor(float("nan")), "patch_max": torch.tensor(float("nan"))}
+        rep_diag = {
+            "rep_cos": torch.tensor(float("nan")),
+            "patch_max": torch.tensor(float("nan")),
+            "weight_max": torch.tensor(float("nan")),
+        }
         sent_diag = {"sentence_nll": torch.tensor(float("nan")), "sentence_log10p": torch.tensor(float("nan"))}
 
         if args.objective in {"representation", "hybrid"}:
-            rep_loss, rep_diag = gemma.representation_loss(views, tau=args.tau)
+            rep_loss, rep_diag = gemma.representation_loss(
+                views, tau=args.tau, spatial_sigma=spatial_sigma
+            )
         if args.objective in {"sentence", "hybrid"}:
             sentence_loss, sent_diag = gemma.sentence_loss(views)
 
@@ -487,6 +534,8 @@ def main():
             "semantic": score,
             "rep_cos": float(rep_diag["rep_cos"].item()),
             "patch_max": float(rep_diag["patch_max"].item()),
+            "weight_max": float(rep_diag["weight_max"].item()),
+            "spatial_sigma": spatial_sigma,
             "sentence_nll": float(sent_diag["sentence_nll"].item()),
             "sentence_log10p": float(sent_diag["sentence_log10p"].item()),
             "commit": float(commit_loss.detach().item()),
@@ -503,6 +552,7 @@ def main():
                 f" | loss={row['loss']:+.5f}"
                 f" | sem={row['semantic']:+.5f}"
                 f" | rep_cos={row['rep_cos']:+.4f}"
+                f" | weight_max={row['weight_max']:.4f}"
                 f" | sent_nll={row['sentence_nll']:.4f}"
                 f" | commit={row['commit']:.5f}"
                 f" | tv={row['tv']:.5f}"
