@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.12.1
+torchvision==0.27.1
+
+transformers==4.57.0
+Pillow>=10.4,<13
+sentencepiece>=0.2.0
