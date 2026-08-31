@@ -1,5 +1,5 @@
 scratch/ 
 output/
-output_vqgan_gemma/
+output*/
 
 __pycache__/

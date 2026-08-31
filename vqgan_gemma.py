@@ -39,6 +39,85 @@ BASELINE_WORDS: List[str] = [
     "time", "fabric", "pasta", "snowflake", "mountain", "echo",
     "piano", "sanctuary", "abyss", "air", "dewdrop", "garden",
     "literature", "rice", "enigma",
+
+    # household / objects
+    "lamp", "mirror", "shelf", "cupboard", "blanket", "pillow",
+    "mug", "bottle", "basket", "bucket", "ladder", "scissors",
+    "notebook", "pencil", "clock", "key", "lock", "window",
+    "door", "carpet", "curtain", "candle", "spoon", "fork",
+
+    # tools / machines
+    "wrench", "screwdriver", "drill", "saw", "engine", "tractor",
+    "camera", "telescope", "microscope", "computer", "printer",
+    "radio", "telephone", "satellite", "robot", "generator", "pump",
+
+    # transport
+    "airplane", "helicopter", "train", "bus", "truck", "motorcycle",
+    "sailboat", "canoe", "submarine", "rocket", "wagon", "scooter",
+
+    # animals
+    "cat", "horse", "cow", "sheep", "goat", "rabbit", "fox",
+    "wolf", "bear", "deer", "elephant", "giraffe", "zebra",
+    "monkey", "dolphin", "whale", "shark", "eagle", "owl",
+    "sparrow", "penguin", "frog", "snake", "lizard", "turtle",
+
+    # plants / nature
+    "tree", "moss", "fern", "cactus", "orchid", "rose", "tulip",
+    "mushroom", "forest", "meadow", "desert", "ocean", "lake",
+    "waterfall", "canyon", "volcano", "island", "coast", "swamp",
+
+    # weather / physical phenomena
+    "rain", "snow", "thunder", "lightning", "storm", "hail",
+    "rainbow", "breeze", "frost", "steam", "shadow", "reflection",
+    "flame", "spark", "wave", "current", "gravity", "friction",
+
+    # materials / substances
+    "wood", "steel", "glass", "plastic", "rubber", "leather",
+    "paper", "concrete", "ceramic", "copper", "silver", "gold",
+    "salt", "sugar", "oil", "water", "ink", "paint",
+
+    # food
+    "bread", "cheese", "apple", "banana", "orange", "grape",
+    "tomato", "potato", "carrot", "onion", "coffee", "tea",
+    "chocolate", "soup", "salad", "pizza", "noodle", "cookie",
+
+    # architecture / places
+    "bridge", "castle", "temple", "church", "palace", "stadium",
+    "school", "hospital", "factory", "warehouse", "harbor", "village",
+    "city", "street", "alley", "plaza", "tunnel", "dam",
+
+    # shapes / visual properties
+    "circle", "triangle", "square", "spiral", "stripe", "checkerboard",
+    "curve", "line", "grid", "pattern", "texture", "symmetry",
+    "brightness", "darkness", "color", "contrast", "depth", "motion",
+
+    # abstract concepts
+    "freedom", "memory", "truth", "beauty", "fear", "hope",
+    "wisdom", "chaos", "order", "peace", "conflict", "energy",
+    "distance", "balance", "chance", "growth", "decay", "change",
+    "identity", "meaning", "language", "history", "culture", "science",
+
+    # activities / processes
+    "running", "writing", "painting", "cooking", "dancing", "flying",
+    "swimming", "reading", "building", "melting", "freezing",
+    "falling", "rising", "spinning", "burning", "growing",
+
+    # music / arts
+    "violin", "guitar", "drum", "trumpet", "melody", "rhythm",
+    "painting", "sculpture", "portrait", "poetry", "theater", "dance",
+
+    # geography / geology
+    "continent", "peninsula", "delta", "basin", "ridge", "cliff",
+    "cave", "crater", "dune", "reef", "lagoon", "geyser",
+
+    # astronomy
+    "planet", "moon", "comet", "asteroid", "meteor", "eclipse",
+    "constellation", "orbit", "cosmos", "sun", "space", "horizon",
+
+    # miscellaneous semantic diversity
+    "signal", "network", "algorithm", "equation", "number", "map",
+    "letter", "book", "coin", "mask", "rope", "feather",
+    "shell", "crown", "sword", "shield", "lantern", "fountain",
 ]
 
 
@@ -94,6 +173,53 @@ def make_views(
         crop = enlarged[:, :, offset_y:offset_y + out_size, offset_x:offset_x + out_size]
         views.append(crop + noise_std * torch.randn_like(crop))
     return torch.cat(views, dim=0)
+
+
+def make_cutouts(
+    image: torch.Tensor,
+    n_cutouts: int,
+    out_size: int,
+    min_scale: float = 0.25,
+    max_scale: float = 1.0,
+    noise_std: float = 0.01,
+) -> torch.Tensor:
+    """VQGAN-CLIP-style random cutout ensemble.
+
+    Each cutout samples an independent square crop, resizes it to the
+    scorer's input size, and applies lightweight differentiable augmentations.
+    Averaging the scorer loss over these views reduces single-patch shortcuts
+    and follows the augmentation strategy used by VQGAN-CLIP.
+    """
+    if n_cutouts <= 0:
+        return image.new_empty((0, image.shape[1], out_size, out_size))
+    if not 0.0 < min_scale <= max_scale <= 1.0:
+        raise ValueError("cutout scales must satisfy 0 < min_scale <= max_scale <= 1")
+
+    _, _, h, w = image.shape
+    short_side = min(h, w)
+    cutouts = []
+    for _ in range(n_cutouts):
+        scale = min_scale + (max_scale - min_scale) * torch.rand((), device=image.device)
+        side = max(8, int(round(float(scale.item()) * short_side)))
+        side = min(side, short_side)
+        y0 = int(torch.randint(0, h - side + 1, (), device=image.device).item())
+        x0 = int(torch.randint(0, w - side + 1, (), device=image.device).item())
+        crop = image[:, :, y0:y0 + side, x0:x0 + side]
+        crop = F.interpolate(crop, size=(out_size, out_size), mode="bilinear", align_corners=False)
+
+        if bool(torch.rand((), device=image.device) < 0.5):
+            crop = crop.flip(-1)
+
+        # Lightweight color jitter, as used in the VQGAN-CLIP cutout path.
+        brightness = 1.0 + (torch.rand((), device=image.device) * 0.2 - 0.1)
+        contrast = 1.0 + (torch.rand((), device=image.device) * 0.2 - 0.1)
+        mean = crop.mean(dim=(-2, -1), keepdim=True)
+        crop = (crop - mean) * contrast + mean
+        crop = crop * brightness
+        if noise_std > 0:
+            crop = crop + noise_std * torch.randn_like(crop)
+        cutouts.append(clamp_with_grad(crop, 0.0, 1.0))
+    return torch.cat(cutouts, dim=0)
 
 
 class GemmaObjective:
@@ -374,10 +500,10 @@ class EMA:
 
 def main():
     parser = argparse.ArgumentParser(description="Experimental VQGAN + Gemma concept synthesis")
-    parser.add_argument("--target", default="lion")
+    parser.add_argument("--target", default="sleeping")
     parser.add_argument("--sentence", default="A person")
     parser.add_argument("--objective", choices=["representation", "sentence", "hybrid"], default="representation")
-    parser.add_argument("--layer", type=int, default=5)
+    parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--instruction", default="Describe this image in one sentence.")
     parser.add_argument("--gemma-model", default=GEMMA_MODEL)
     parser.add_argument("--vq-repo", default=VQ_REPO)
@@ -388,8 +514,13 @@ def main():
     parser.add_argument("--vq-dtype", default="float32")
     parser.add_argument("--image-size", type=int, default=448)
     parser.add_argument("--steps", type=int, default=800)
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=0.15)
     parser.add_argument("--views", type=int, default=4)
+    parser.add_argument("--cutouts", type=int, default=8,
+                        help="additional VQGAN-CLIP random cutouts per step")
+    parser.add_argument("--cutout-min-scale", type=float, default=0.25)
+    parser.add_argument("--cutout-max-scale", type=float, default=1.0)
+    parser.add_argument("--cutout-noise-std", type=float, default=0.01)
     parser.add_argument("--tau", type=float, default=0.5)
     parser.add_argument("--spatial-sigma-start", type=float, default=2.0)
     parser.add_argument("--spatial-sigma-end", type=float, default=16.0)
@@ -399,7 +530,13 @@ def main():
     parser.add_argument("--sentence-weight", type=float, default=0.15)
     parser.add_argument("--commit-weight", type=float, default=0.20)
     parser.add_argument("--tv-weight", type=float, default=0.04)
-    parser.add_argument("--latent-l2-weight", type=float, default=0.001)
+    parser.add_argument("--latent-l2-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--latent-l2-decay",
+        type=float,
+        default=0.005,
+        help="multiplicative per-step decay (0.005 means 0.995x per step)",
+    )
     parser.add_argument("--ema-decay", type=float, default=0.98)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
@@ -450,8 +587,10 @@ def main():
     print(f"steps            = {args.steps}")
     print(f"lr               = {args.lr}")
     print(f"views            = {args.views}")
+    print(f"cutouts          = {args.cutouts} ({args.cutout_min_scale} -> {args.cutout_max_scale})")
     print(f"spatial sigma    = {args.spatial_sigma_start} -> {args.spatial_sigma_end}")
     print(f"DAS shift/noise  = +/-{args.das_shift} / {args.das_noise_std}")
+    print(f"latent L2 decay  = {args.latent_l2_decay} per step")
     print(f"rep weight       = {args.rep_weight}")
     print(f"sentence weight  = {args.sentence_weight}")
     print(f"commit weight    = {args.commit_weight}")
@@ -469,6 +608,16 @@ def main():
             shift=args.das_shift,
             noise_std=args.das_noise_std,
         )
+        if args.cutouts > 0:
+            cutouts = make_cutouts(
+                image,
+                args.cutouts,
+                gemma.model_image_h,
+                min_scale=args.cutout_min_scale,
+                max_scale=args.cutout_max_scale,
+                noise_std=args.cutout_noise_std,
+            )
+            views = torch.cat([views, cutouts], dim=0)
         views = views.to(gemma.device)
 
         progress = step / max(args.steps - 1, 1)
@@ -502,11 +651,18 @@ def main():
 
         tv = total_variation(image)
         latent_l2 = generator.z.square().mean()
+        if not 0.0 <= args.latent_l2_decay < 1.0:
+            raise ValueError("latent-l2-decay must be in [0, 1)")
+        # Decay the latent penalty so it constrains early texture formation
+        # while allowing semantic optimization more freedom later.
+        latent_l2_weight = args.latent_l2_weight * (
+            1.0 - args.latent_l2_decay
+        ) ** step
         loss = (
             semantic
             + args.commit_weight * commit_loss
             + args.tv_weight * tv
-            + args.latent_l2_weight * latent_l2
+            + latent_l2_weight * latent_l2
         )
 
         loss.backward()
@@ -541,6 +697,7 @@ def main():
             "commit": float(commit_loss.detach().item()),
             "tv": float(tv.detach().item()),
             "latent_l2": float(latent_l2.detach().item()),
+            "latent_l2_weight": latent_l2_weight,
             "grad_norm": grad_norm,
             "lr": optimizer.param_groups[0]["lr"],
         }
