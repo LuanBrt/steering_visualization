@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from diffusers import VQModel
 from PIL import Image
+from torch.utils.checkpoint import checkpoint
 from torchvision.utils import save_image
 from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 
@@ -239,6 +240,8 @@ class GemmaObjective:
         self.sentence = sentence
         self.layer = layer
         self.instruction = instruction
+        if layer < 1:
+            raise ValueError("layer must be at least 1 (the embedding output is layer 0)")
 
         print(f"Loading Gemma {model_id} on {self.device}")
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -248,6 +251,21 @@ class GemmaObjective:
             torch_dtype=dtype,
         ).to(self.device).eval()
         self.model.requires_grad_(False)
+
+        # Capture only the requested transformer block instead of asking the
+        # model to retain every intermediate hidden state. `layer` preserves
+        # the old output_hidden_states indexing: layer 1 is block 0.
+        self._hook_hidden = None
+
+        def hook_fn(_module, _inputs, output):
+            self._hook_hidden = output[0] if isinstance(output, tuple) else output
+
+        language_model = self.model.model.language_model
+        try:
+            layer_module = language_model.layers[layer - 1]
+        except (AttributeError, IndexError) as exc:
+            raise ValueError(f"layer {layer} is not available in Gemma") from exc
+        self._layer_hook = layer_module.register_forward_hook(hook_fn)
 
         template, dummy_pixels = self._image_template()
         self.image_template = template
@@ -278,6 +296,35 @@ class GemmaObjective:
         messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
         return self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
+    def _forward_with_hook(self, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Run Gemma while retaining only the hooked layer activation.
+
+        During optimization, checkpointing recomputes Gemma during backward
+        instead of retaining its full transformer activation graph. The hook
+        output is returned from the checkpoint wrapper, so the image gradient
+        still flows through the selected layer.
+        """
+        keys = tuple(inputs)
+        values = tuple(inputs[key] for key in keys)
+
+        def forward(*args):
+            self._hook_hidden = None
+            self.model(
+                **dict(zip(keys, args)),
+                output_hidden_states=False,
+                use_cache=False,
+                return_dict=True,
+            )
+            if self._hook_hidden is None:
+                raise RuntimeError("Gemma layer hook did not capture an activation")
+            hidden = self._hook_hidden
+            self._hook_hidden = None
+            return hidden
+
+        if any(value.requires_grad for value in values):
+            return checkpoint(forward, *values, use_reentrant=False)
+        return forward(*values)
+
     def text_activation(self, text: str) -> torch.Tensor:
         rendered = self.render_text_chat(text)
         start = rendered.find(text)
@@ -295,8 +342,7 @@ class GemmaObjective:
             dtype=torch.bool,
         )
         inputs = {k: v.to(self.device) for k, v in enc.items() if torch.is_tensor(v)}
-        out = self.model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
-        hidden = out.hidden_states[self.layer][0]
+        hidden = self._forward_with_hook(inputs)[0]
         return hidden[mask].mean(dim=0).float()
 
     def _image_template(self):
@@ -332,13 +378,7 @@ class GemmaObjective:
             for k, v in self.image_template.items()
         }
         inputs["pixel_values"] = self.preprocess_image(image)
-        out = self.model(
-            **inputs,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-        hidden = out.hidden_states[self.layer]
+        hidden = self._forward_with_hook(inputs)
         mask = inputs["token_type_ids"].bool()
         n_tokens = int(mask[0].sum().item())
         return hidden[mask].view(batch, n_tokens, hidden.shape[-1]).float()
@@ -348,17 +388,62 @@ class GemmaObjective:
         image: torch.Tensor,
         tau: float = 0.25,
         spatial_sigma: float = 2.0,
+        distance: str = "cosine",
+        batch_size: int | None = None,
     ) -> tuple[torch.Tensor, dict]:
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be positive or None")
+        if batch_size is not None and image.shape[0] > batch_size:
+            # Keep all views/cutouts in one logical objective while limiting
+            # the peak Gemma memory used by each forward pass. Weighting by
+            # chunk size makes this identical to one large batch.
+            image_chunks = list(image.split(batch_size, dim=0))
+            chunks = [
+                self.representation_loss(
+                    chunk,
+                    tau=tau,
+                    spatial_sigma=spatial_sigma,
+                    distance=distance,
+                    batch_size=None,
+                )
+                for chunk in image_chunks
+            ]
+            chunk_sizes = [chunk.shape[0] for chunk in image_chunks]
+            total = image.shape[0]
+            weighted = lambda key: sum(
+                result[1][key] * size for result, size in zip(chunks, chunk_sizes)
+            ) / total
+            return (
+                sum(result[0] * size for result, size in zip(chunks, chunk_sizes)) / total,
+                {
+                    "rep_cos": weighted("rep_cos"),
+                    "rep_distance": weighted("rep_distance"),
+                    "patch_max": max(result[1]["patch_max"] for result in chunks),
+                    "weight_max": max(result[1]["weight_max"] for result in chunks),
+                },
+            )
+
+        if distance == "geodesic":
+            distance = "spherical"
+        if distance not in {"cosine", "spherical"}:
+            raise ValueError(
+                f"unknown representation distance {distance!r}; "
+                "expected 'cosine' or 'spherical'"
+            )
+
         patches = self.image_patch_activations(image)
         centered = patches - self.image_baseline[None, None, :]
-        scores = F.cosine_similarity(
-            centered,
-            self.text_direction[None, None, :],
-            dim=-1,
-            eps=1e-8,
-        )
-        # Match paper_experiment.py: add a centered spatial Gaussian prior
-        # to the patch logits before the temperature softmax.
+        target = self.text_direction[None, None, :]
+        if distance == "cosine":
+            scores = F.cosine_similarity(centered, target, dim=-1, eps=1e-8)
+        else:
+            centered_normalized = F.normalize(centered, dim=-1, eps=1e-8)
+            target_normalized = F.normalize(target, dim=-1, eps=1e-8)
+            chord_half = (centered_normalized - target_normalized).norm(dim=-1) / 2.0
+            # For unit vectors this is theta^2 / 2, where theta is the
+            # geodesic angle. Negate it because larger scores get larger
+            # softmax weights below.
+            scores = -2.0 * torch.asin(chord_half.clamp(max=1.0)).square()
         n_patches = centered.shape[1]
         side = int(round(math.sqrt(n_patches)))
         if side * side == n_patches:
@@ -376,59 +461,23 @@ class GemmaObjective:
 
         weights = F.softmax((scores + log_g[None, :]) / tau, dim=-1)
         rep = (weights[..., None] * centered).sum(dim=1)
-        cosine = F.cosine_similarity(rep, self.text_direction[None, :], dim=-1, eps=1e-8)
-        return -cosine.mean(), {
+        target = self.text_direction[None, :]
+        if distance == "cosine":
+            cosine = F.cosine_similarity(rep, target, dim=-1, eps=1e-8)
+            loss = -cosine.mean()
+            rep_distance = torch.zeros_like(cosine)
+        else:
+            rep_normalized = F.normalize(rep, dim=-1, eps=1e-8)
+            target_normalized = F.normalize(target, dim=-1, eps=1e-8)
+            chord_half = (rep_normalized - target_normalized).norm(dim=-1) / 2.0
+            rep_distance = 2.0 * torch.asin(chord_half.clamp(max=1.0)).square()
+            cosine = F.cosine_similarity(rep, target, dim=-1, eps=1e-8)
+            loss = rep_distance.mean()
+        return loss, {
             "rep_cos": cosine.mean().detach(),
+            "rep_distance": rep_distance.mean().detach(),
             "patch_max": scores.max().detach(),
             "weight_max": weights.max().detach(),
-        }
-
-    def sentence_loss(self, image: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        batch = image.shape[0]
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": Image.new("RGB", (448, 448), (128, 128, 128))},
-                {"type": "text", "text": self.instruction},
-            ],
-        }]
-        prefix = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            add_generation_prompt=True,
-            do_pan_and_scan=False,
-        )
-        prefix.pop("pixel_values")
-        prefix.pop("num_crops", None)
-        prefix = {k: v.to(self.device) for k, v in prefix.items() if torch.is_tensor(v)}
-
-        target_ids = self.tokenizer(self.sentence, add_special_tokens=False, return_tensors="pt")["input_ids"].to(self.device)
-        prefix_ids = prefix["input_ids"].repeat(batch, 1)
-        prefix_attn = prefix["attention_mask"].repeat(batch, 1)
-        prefix_types = prefix.get("token_type_ids", torch.zeros_like(prefix["input_ids"]))
-        prefix_types = prefix_types.repeat(batch, 1)
-        target_ids = target_ids.repeat(batch, 1)
-
-        input_ids = torch.cat([prefix_ids, target_ids], dim=1)
-        attention_mask = torch.cat([prefix_attn, torch.ones_like(target_ids)], dim=1)
-        token_type_ids = torch.cat([prefix_types, torch.zeros_like(target_ids)], dim=1)
-        labels = torch.full_like(input_ids, -100)
-        labels[:, prefix_ids.shape[1]:] = target_ids
-
-        out = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            pixel_values=self.preprocess_image(image),
-            labels=labels,
-            use_cache=False,
-            return_dict=True,
-        )
-        return out.loss, {
-            "sentence_nll": out.loss.detach(),
-            "sentence_log10p": (-out.loss.detach() / math.log(10.0)),
         }
 
 
@@ -500,9 +549,7 @@ class EMA:
 
 def main():
     parser = argparse.ArgumentParser(description="Experimental VQGAN + Gemma concept synthesis")
-    parser.add_argument("--target", default="sleeping")
-    parser.add_argument("--sentence", default="A person")
-    parser.add_argument("--objective", choices=["representation", "sentence", "hybrid"], default="representation")
+    parser.add_argument("--target", default="giraffe")
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--instruction", default="Describe this image in one sentence.")
     parser.add_argument("--gemma-model", default=GEMMA_MODEL)
@@ -512,32 +559,45 @@ def main():
     parser.add_argument("--vq-device", default="cuda:1")
     parser.add_argument("--gemma-dtype", default="bfloat16")
     parser.add_argument("--vq-dtype", default="float32")
-    parser.add_argument("--image-size", type=int, default=448)
-    parser.add_argument("--steps", type=int, default=800)
-    parser.add_argument("--lr", type=float, default=0.15)
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=0.08)
     parser.add_argument("--views", type=int, default=4)
-    parser.add_argument("--cutouts", type=int, default=8,
-                        help="additional VQGAN-CLIP random cutouts per step")
-    parser.add_argument("--cutout-min-scale", type=float, default=0.25)
+    parser.add_argument("--cutouts", type=int, default=6, help="additional VQGAN-CLIP random cutouts per step")
+    parser.add_argument(
+        "--gemma-batch-size",
+        type=int,
+        default=8,
+        help="views/cutouts per Gemma forward pass; 0 uses the full batch",
+    )
+    parser.add_argument("--cutout-min-scale", type=float, default=0.45)
     parser.add_argument("--cutout-max-scale", type=float, default=1.0)
     parser.add_argument("--cutout-noise-std", type=float, default=0.01)
-    parser.add_argument("--tau", type=float, default=0.5)
+    parser.add_argument("--tau", type=float, default=0.2)
+    parser.add_argument(
+        "--representation-distance",
+        "--rep-distance",
+        choices=["cosine", "spherical", "geodesic"],
+        default="spherical",
+        dest="representation_distance",
+        help="distance used by the representation objective (default: cosine)",
+    )
     parser.add_argument("--spatial-sigma-start", type=float, default=2.0)
     parser.add_argument("--spatial-sigma-end", type=float, default=16.0)
     parser.add_argument("--das-shift", type=int, default=DAS_SHIFT)
     parser.add_argument("--das-noise-std", type=float, default=DAS_NOISE_STD)
     parser.add_argument("--rep-weight", type=float, default=4.0)
     parser.add_argument("--sentence-weight", type=float, default=0.15)
-    parser.add_argument("--commit-weight", type=float, default=0.20)
-    parser.add_argument("--tv-weight", type=float, default=0.04)
-    parser.add_argument("--latent-l2-weight", type=float, default=0.01)
+    parser.add_argument("--commit-weight", type=float, default=0.02)
+    parser.add_argument("--tv-weight", type=float, default=0.02)
+    parser.add_argument("--latent-l2-weight", type=float, default=0)
     parser.add_argument(
         "--latent-l2-decay",
         type=float,
-        default=0.005,
+        default=0,
         help="multiplicative per-step decay (0.005 means 0.995x per step)",
     )
-    parser.add_argument("--ema-decay", type=float, default=0.98)
+    parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--out", default="output_vqgan_gemma")
@@ -554,7 +614,7 @@ def main():
         device=args.gemma_device,
         dtype=parse_dtype(args.gemma_dtype),
         target=args.target,
-        sentence=args.sentence,
+        sentence="",
         layer=args.layer,
         instruction=args.instruction,
     )
@@ -582,16 +642,16 @@ def main():
 
     print("\n=== VQGAN + Gemma optimization ===")
     print(f"target           = {args.target!r}")
-    print(f"sentence         = {args.sentence!r}")
-    print(f"objective        = {args.objective}")
     print(f"steps            = {args.steps}")
     print(f"lr               = {args.lr}")
     print(f"views            = {args.views}")
     print(f"cutouts          = {args.cutouts} ({args.cutout_min_scale} -> {args.cutout_max_scale})")
+    print(f"Gemma batch size  = {args.gemma_batch_size or 'full'}")
     print(f"spatial sigma    = {args.spatial_sigma_start} -> {args.spatial_sigma_end}")
     print(f"DAS shift/noise  = +/-{args.das_shift} / {args.das_noise_std}")
     print(f"latent L2 decay  = {args.latent_l2_decay} per step")
     print(f"rep weight       = {args.rep_weight}")
+    print(f"rep distance     = {args.representation_distance}")
     print(f"sentence weight  = {args.sentence_weight}")
     print(f"commit weight    = {args.commit_weight}")
     print(f"tv weight        = {args.tv_weight}")
@@ -626,7 +686,6 @@ def main():
         )
 
         rep_loss = torch.zeros((), device=gemma.device)
-        sentence_loss = torch.zeros((), device=gemma.device)
         rep_diag = {
             "rep_cos": torch.tensor(float("nan")),
             "patch_max": torch.tensor(float("nan")),
@@ -634,20 +693,18 @@ def main():
         }
         sent_diag = {"sentence_nll": torch.tensor(float("nan")), "sentence_log10p": torch.tensor(float("nan"))}
 
-        if args.objective in {"representation", "hybrid"}:
-            rep_loss, rep_diag = gemma.representation_loss(
-                views, tau=args.tau, spatial_sigma=spatial_sigma
-            )
-        if args.objective in {"sentence", "hybrid"}:
-            sentence_loss, sent_diag = gemma.sentence_loss(views)
+        rep_loss, rep_diag = gemma.representation_loss(
+            views,
+            tau=args.tau,
+            spatial_sigma=spatial_sigma,
+            distance=args.representation_distance,
+            batch_size=args.gemma_batch_size or None,
+        )
 
         # Regularizers live on the VQ device. Move scalar semantic losses back
         # before combining so autograd crosses the device-to-device copy.
         semantic = torch.zeros((), device=generator.device)
-        if args.objective in {"representation", "hybrid"}:
-            semantic = semantic + args.rep_weight * rep_loss.to(generator.device)
-        if args.objective in {"sentence", "hybrid"}:
-            semantic = semantic + args.sentence_weight * sentence_loss.to(generator.device)
+        semantic = semantic + args.rep_weight * rep_loss.to(generator.device)
 
         tv = total_variation(image)
         latent_l2 = generator.z.square().mean()
