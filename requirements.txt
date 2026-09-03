@@ -4,5 +4,10 @@ torch==2.12.1
 torchvision==0.27.1
 
 transformers==4.57.0
+huggingface-hub>=0.24
+omegaconf>=2.3
+einops>=0.7
+pytorch-lightning>=2.0
+-e git+https://github.com/CompVis/taming-transformers.git#egg=taming-transformers
 Pillow>=10.4,<13
 sentencepiece>=0.2.0

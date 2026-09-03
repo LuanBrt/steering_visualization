@@ -2,4 +2,8 @@ scratch/
 output/
 output*/
 
+
+src/taming-transformers/
+.agents/
+.codex/
 __pycache__/

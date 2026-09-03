@@ -3,13 +3,36 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
+import json
 import math
 from pathlib import Path
+import sys
+import types
 from typing import List
+
+# The upstream setup.py does not discover taming's namespace packages. Keep
+# the editable source checkout importable when installed from requirements.txt.
+_taming_source = Path(__file__).resolve().parent / "src" / "taming-transformers"
+if _taming_source.is_dir():
+    sys.path.insert(0, str(_taming_source))
+
+if "main" not in sys.modules:
+    _compat_main = types.ModuleType("main")
+
+    def instantiate_from_config(config):
+        module_name, class_name = config["target"].rsplit(".", 1)
+        cls = getattr(importlib.import_module(module_name), class_name)
+        return cls(**config.get("params", {}))
+
+    _compat_main.instantiate_from_config = instantiate_from_config
+    sys.modules["main"] = _compat_main
+
+from huggingface_hub import hf_hub_download
+from taming.models.vqgan import VQModel
 
 import torch
 import torch.nn.functional as F
-from diffusers import VQModel
 from PIL import Image
 from torch.utils.checkpoint import checkpoint
 from torchvision.utils import save_image
@@ -17,8 +40,7 @@ from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 
 
 GEMMA_MODEL = "google/gemma-3-4b-it"
-VQ_REPO = "CompVis/ldm-super-resolution-4x-openimages"
-VQ_SUBFOLDER = "vqvae"
+TAMING_VQ_REPO = "valhalla/vqgan_imagenet_f16_16384"
 
 # Same broad baseline idea as the paper replication: subtract the average
 # activation of unrelated words before aligning text and image representations.
@@ -485,7 +507,6 @@ class VQGANGenerator:
     def __init__(
         self,
         repo: str,
-        subfolder: str,
         device: str,
         dtype: torch.dtype,
         image_size: int,
@@ -495,14 +516,57 @@ class VQGANGenerator:
         self.dtype = dtype
         self.image_size = image_size
 
-        print(f"Loading VQ model {repo}/{subfolder} on {self.device}")
-        self.model = VQModel.from_pretrained(repo, subfolder=subfolder, torch_dtype=dtype).to(self.device).eval()
+        # The Hugging Face repository contains the original taming-transformers
+        # weights as a config.json + pytorch_model.bin pair.  Instantiate the
+        # original VQModel so its quantizer and decoder remain differentiable.
+        print(f"Loading taming-transformers VQGAN {repo} on {self.device}")
+        config_path = hf_hub_download(repo_id=repo, filename="config.json")
+        weights_path = hf_hub_download(repo_id=repo, filename="pytorch_model.bin")
+        with open(config_path) as f:
+            config = json.load(f)
+
+        # Support both the original taming names and the equivalent names in
+        # the Hugging Face conversion of this checkpoint.
+        get = lambda old, new, default=None: config.get(old, config.get(new, default))
+        ddconfig = {
+            "double_z": get("double_z", "double_z", False),
+            "z_channels": get("z_channels", "z_channels"),
+            "resolution": get("resolution", "resolution"),
+            "in_channels": get("in_channels", "num_channels", 3),
+            "out_ch": get("out_ch", "num_channels", 3),
+            "ch": get("ch", "hidden_channels"),
+            "ch_mult": get("ch_mult", "channel_mult"),
+            "num_res_blocks": get("num_res_blocks", "num_res_blocks"),
+            "attn_resolutions": get("attn_resolutions", "attn_resolutions"),
+            "dropout": get("dropout", "dropout", 0.0),
+        }
+        # The loss is not used during inference/optimization. Identity avoids
+        # constructing the discriminator and its extra perceptual dependencies.
+        self.model = VQModel(
+            ddconfig=ddconfig,
+            lossconfig={"target": "torch.nn.Identity", "params": {}},
+            n_embed=get("n_embed", "num_embeddings", 16384),
+            embed_dim=get("embed_dim", "quantized_embed_dim", 256),
+        )
+        state = torch.load(weights_path, map_location="cpu", weights_only=False)
+        if "state_dict" in state:
+            state = state["state_dict"]
+        if not isinstance(state, dict):
+            raise ValueError(f"Unsupported VQGAN checkpoint format in {weights_path}")
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise ValueError(
+                "VQGAN checkpoint does not match its config: "
+                f"{len(missing)} missing, {len(unexpected)} unexpected keys"
+            )
+        self.model = self.model.to(device=self.device, dtype=dtype).eval()
         self.model.requires_grad_(False)
 
-        # Decoder checkpoint has len(block_out_channels)-1 spatial downsamples.
-        factor = 2 ** (len(self.model.config.block_out_channels) - 1)
-        self.latent_h = math.ceil(image_size / factor)
-        self.latent_w = math.ceil(image_size / factor)
+        factor = 16
+        if image_size % factor != 0:
+            raise ValueError(f"image-size must be divisible by VQGAN compression factor f={factor}")
+        self.latent_h = image_size // factor
+        self.latent_w = image_size // factor
         self.embed_dim = self.model.quantize.embedding.weight.shape[1]
 
         g = torch.Generator(device=self.device).manual_seed(seed)
@@ -524,8 +588,7 @@ class VQGANGenerator:
     def decode(self) -> tuple[torch.Tensor, torch.Tensor]:
         z_model = self.z.to(self.dtype)
         quant, commit_loss, _ = self.model.quantize(z_model)
-        quant2 = self.model.post_quant_conv(quant)
-        raw = self.model.decoder(quant2)
+        raw = self.model.decode(quant)
         image = clamp_with_grad((raw.float() + 1.0) * 0.5, 0.0, 1.0)
         return image, commit_loss.float()
 
@@ -553,8 +616,7 @@ def main():
     parser.add_argument("--layer", type=int, default=1)
     parser.add_argument("--instruction", default="Describe this image in one sentence.")
     parser.add_argument("--gemma-model", default=GEMMA_MODEL)
-    parser.add_argument("--vq-repo", default=VQ_REPO)
-    parser.add_argument("--vq-subfolder", default=VQ_SUBFOLDER)
+    parser.add_argument("--vq-repo", default=TAMING_VQ_REPO)
     parser.add_argument("--gemma-device", default="cuda:0")
     parser.add_argument("--vq-device", default="cuda:1")
     parser.add_argument("--gemma-dtype", default="bfloat16")
@@ -621,7 +683,6 @@ def main():
 
     generator = VQGANGenerator(
         repo=args.vq_repo,
-        subfolder=args.vq_subfolder,
         device=args.vq_device,
         dtype=parse_dtype(args.vq_dtype),
         image_size=args.image_size,
