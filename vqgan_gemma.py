@@ -511,10 +511,16 @@ class VQGANGenerator:
         dtype: torch.dtype,
         image_size: int,
         seed: int,
+        init_scale: float,
+        init_method: str,
     ):
         self.device = torch.device(device)
         self.dtype = dtype
         self.image_size = image_size
+        if init_scale < 0:
+            raise ValueError("init-scale must be non-negative")
+        if init_method not in {"gaussian", "codebook"}:
+            raise ValueError("init-method must be 'gaussian' or 'codebook'")
 
         # The Hugging Face repository contains the original taming-transformers
         # weights as a config.json + pytorch_model.bin pair.  Instantiate the
@@ -570,16 +576,27 @@ class VQGANGenerator:
         self.embed_dim = self.model.quantize.embedding.weight.shape[1]
 
         g = torch.Generator(device=self.device).manual_seed(seed)
-        codebook = self.model.quantize.embedding.weight.detach()
-        indices = torch.randint(
-            0,
-            codebook.shape[0],
-            (self.latent_h * self.latent_w,),
-            generator=g,
-            device=self.device,
-        )
-        init = codebook[indices].view(self.latent_h, self.latent_w, self.embed_dim)
-        init = init.permute(2, 0, 1).unsqueeze(0).contiguous().float()
+        codebook = self.model.quantize.embedding.weight.detach().float()
+        if init_method == "codebook":
+            indices = torch.randint(
+                0,
+                codebook.shape[0],
+                (self.latent_h * self.latent_w,),
+                generator=g,
+                device=self.device,
+            )
+            init = codebook[indices].view(self.latent_h, self.latent_w, self.embed_dim)
+            init = init.permute(2, 0, 1).unsqueeze(0).contiguous()
+        else:
+            codebook_mean = codebook.mean(dim=0).view(1, self.embed_dim, 1, 1)
+            codebook_std = codebook.std(dim=0, unbiased=False).view(1, self.embed_dim, 1, 1)
+            init = codebook_mean + init_scale * codebook_std * torch.randn(
+                (1, self.embed_dim, self.latent_h, self.latent_w),
+                generator=g,
+                device=self.device,
+                dtype=torch.float32,
+            )
+        init = init.float()
         self.z = torch.nn.Parameter(init)
 
         print(f"Codebook: {codebook.shape[0]} x {codebook.shape[1]}")
@@ -612,8 +629,8 @@ class EMA:
 
 def main():
     parser = argparse.ArgumentParser(description="Experimental VQGAN + Gemma concept synthesis")
-    parser.add_argument("--target", default="giraffe")
-    parser.add_argument("--layer", type=int, default=1)
+    parser.add_argument("--target", default="fear")
+    parser.add_argument("--layer", type=int, default=5)
     parser.add_argument("--instruction", default="Describe this image in one sentence.")
     parser.add_argument("--gemma-model", default=GEMMA_MODEL)
     parser.add_argument("--vq-repo", default=TAMING_VQ_REPO)
@@ -622,10 +639,22 @@ def main():
     parser.add_argument("--gemma-dtype", default="bfloat16")
     parser.add_argument("--vq-dtype", default="float32")
     parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument(
+        "--init-scale",
+        type=float,
+        default=0.5,
+        help="standard-deviation multiplier for continuous codebook-space initialization",
+    )
+    parser.add_argument(
+        "--init-method",
+        choices=["gaussian", "codebook"],
+        default="codebook",
+        help="latent initialization method; codebook restores independent random entries",
+    )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=0.08)
     parser.add_argument("--views", type=int, default=4)
-    parser.add_argument("--cutouts", type=int, default=6, help="additional VQGAN-CLIP random cutouts per step")
+    parser.add_argument("--cutouts", type=int, default=16, help="additional VQGAN-CLIP random cutouts per step")
     parser.add_argument(
         "--gemma-batch-size",
         type=int,
@@ -662,7 +691,7 @@ def main():
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--out", default="output_vqgan_gemma")
+    parser.add_argument("--out", default="output_vqgan_gemma_fear_codebook")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -687,6 +716,8 @@ def main():
         dtype=parse_dtype(args.vq_dtype),
         image_size=args.image_size,
         seed=args.seed,
+        init_scale=args.init_scale,
+        init_method=args.init_method,
     )
 
     optimizer = torch.optim.AdamW([generator.z], lr=args.lr, betas=(0.9, 0.99), weight_decay=0.0)

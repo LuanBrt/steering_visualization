@@ -4,6 +4,7 @@ output*/
 
 
 src/taming-transformers/
+ablation_*/
 .agents/
 .codex/
 __pycache__/
