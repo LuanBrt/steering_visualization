@@ -42,8 +42,8 @@ from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 GEMMA_MODEL = "google/gemma-3-4b-it"
 TAMING_VQ_REPO = "valhalla/vqgan_imagenet_f16_16384"
 
-# Same broad baseline idea as the paper replication: subtract the average
-# activation of unrelated words before aligning text and image representations.
+# Background concepts used to estimate the representation mean and its dominant
+# directions.  The target is never included in this set.
 BASELINE_WORDS: List[str] = [
     "desk", "jacket", "gondola", "laughter", "intelligence", "bicycle",
     "chair", "orchestra", "sand", "pottery", "arrowhead", "jewelry",
@@ -255,6 +255,9 @@ class GemmaObjective:
         sentence: str,
         layer: int,
         instruction: str,
+        baseline_pcs: int = 3,
+        background_transform: str = "whitening",
+        whitening_ridge: float = 0.05,
     ):
         self.device = torch.device(device)
         self.dtype = dtype
@@ -262,8 +265,17 @@ class GemmaObjective:
         self.sentence = sentence
         self.layer = layer
         self.instruction = instruction
+        self.baseline_pcs = baseline_pcs
+        self.background_transform = background_transform
+        self.whitening_ridge = whitening_ridge
         if layer < 1:
             raise ValueError("layer must be at least 1 (the embedding output is layer 0)")
+        if baseline_pcs < 0:
+            raise ValueError("baseline_pcs must be non-negative")
+        if background_transform not in {"top-pc", "whitening"}:
+            raise ValueError("background_transform must be 'top-pc' or 'whitening'")
+        if whitening_ridge < 0:
+            raise ValueError("whitening_ridge must be non-negative")
 
         print(f"Loading Gemma {model_id} on {self.device}")
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -300,19 +312,76 @@ class GemmaObjective:
 
         print("Computing language baseline...")
         with torch.no_grad():
-            baseline = torch.stack([self.text_activation(w) for w in BASELINE_WORDS]).mean(dim=0)
+            background = torch.stack([self.text_activation(w) for w in BASELINE_WORDS])
+            self.background_mean = background.mean(dim=0)
+            centered_background = background - self.background_mean
+            # Keep PCA statistics in fp32 even when Gemma runs in bf16/fp16.
+            if background_transform == "top-pc":
+                # Centering makes the sample matrix rank at most N - 1.
+                max_pcs = min(centered_background.shape[0] - 1, centered_background.shape[1])
+                if baseline_pcs > max_pcs:
+                    raise ValueError(
+                        f"baseline_pcs={baseline_pcs} exceeds the available rank "
+                        f"({max_pcs})"
+                    )
+                if baseline_pcs:
+                    _, _, vh = torch.linalg.svd(
+                        centered_background.float(), full_matrices=False
+                    )
+                    self.background_pcs = vh[:baseline_pcs].T.contiguous()
+                else:
+                    self.background_pcs = centered_background.new_empty(
+                        centered_background.shape[-1], 0
+                    )
+            else:
+                # The empirical covariance is rank deficient when the
+                # background set is smaller than the hidden dimension.  A
+                # ridge relative to mean variance makes Sigma^(-1/2) defined
+                # in the unsampled directions too.
+                _, singular_values, vh = torch.linalg.svd(
+                    centered_background.float(), full_matrices=False
+                )
+                covariance_scale = centered_background.float().square().mean()
+                ridge = whitening_ridge * covariance_scale
+                self.background_basis = vh.T.contiguous()
+                self.background_inv_std = (
+                    singular_values.square() / (centered_background.shape[0] - 1) + ridge
+                ).rsqrt()
+                self.background_null_inv_std = ridge.rsqrt() if ridge > 0 else None
             target_act = self.text_activation(target)
-        self.text_direction = F.normalize(target_act - baseline, dim=0, eps=1e-8)
-
-        print("Computing gray-image baseline...")
-        gray = torch.full((1, 3, self.model_image_h, self.model_image_w), 0.5, device=self.device)
-        with torch.no_grad():
-            gray_patches = self.image_patch_activations(gray)
-        self.image_baseline = gray_patches.mean(dim=1)[0]
+        self.text_direction = F.normalize(self.transform_background(target_act), dim=0, eps=1e-8)
 
         print(f"Gemma image size: {self.model_image_h}x{self.model_image_w}")
         print(f"Gemma layer: {self.layer}")
+        print(f"Background concepts: {len(BASELINE_WORDS)}")
+        print(f"Background transform: {background_transform}")
+        if background_transform == "top-pc":
+            print(f"Removed PCs: {baseline_pcs}")
+        else:
+            print(f"Whitening ridge: {whitening_ridge:g}")
         print(f"Target concept: {self.target!r}")
+
+    def transform_background(self, activations: torch.Tensor) -> torch.Tensor:
+        """Center and transform activations using background statistics.
+
+        ``top-pc`` applies All-but-the-Top. ``whitening`` applies a
+        regularized covariance inverse square root without materializing the
+        hidden_dim x hidden_dim covariance matrix.
+        """
+        centered = activations - self.background_mean.to(activations)
+        if self.background_transform == "top-pc":
+            pcs = self.background_pcs.to(activations)
+            if pcs.shape[-1]:
+                centered = centered - centered @ pcs @ pcs.T
+            return centered
+
+        basis = self.background_basis.to(activations)
+        coordinates = centered @ basis
+        whitened = (coordinates * self.background_inv_std.to(activations)) @ basis.T
+        residual = centered - coordinates @ basis.T
+        if self.background_null_inv_std is not None:
+            whitened = whitened + residual * self.background_null_inv_std.to(activations)
+        return whitened
 
     def render_text_chat(self, text: str) -> str:
         messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
@@ -454,7 +523,7 @@ class GemmaObjective:
             )
 
         patches = self.image_patch_activations(image)
-        centered = patches - self.image_baseline[None, None, :]
+        centered = self.transform_background(patches)
         target = self.text_direction[None, None, :]
         if distance == "cosine":
             scores = F.cosine_similarity(centered, target, dim=-1, eps=1e-8)
@@ -629,9 +698,27 @@ class EMA:
 
 def main():
     parser = argparse.ArgumentParser(description="Experimental VQGAN + Gemma concept synthesis")
-    parser.add_argument("--target", default="fear")
+    parser.add_argument("--target", default="diagram")
     parser.add_argument("--layer", type=int, default=5)
     parser.add_argument("--instruction", default="Describe this image in one sentence.")
+    parser.add_argument(
+        "--baseline-pcs",
+        type=int,
+        default=3,
+        help="number of dominant PCs to remove from background-centered activations",
+    )
+    parser.add_argument(
+        "--background-transform",
+        choices=["top-pc", "whitening"],
+        default="whitening",
+        help="background correction used for text/image representations",
+    )
+    parser.add_argument(
+        "--whitening-ridge",
+        type=float,
+        default=0.05,
+        help="ridge as a fraction of mean background variance for whitening",
+    )
     parser.add_argument("--gemma-model", default=GEMMA_MODEL)
     parser.add_argument("--vq-repo", default=TAMING_VQ_REPO)
     parser.add_argument("--gemma-device", default="cuda:0")
@@ -648,13 +735,13 @@ def main():
     parser.add_argument(
         "--init-method",
         choices=["gaussian", "codebook"],
-        default="codebook",
+        default="gaussian",
         help="latent initialization method; codebook restores independent random entries",
     )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=0.08)
     parser.add_argument("--views", type=int, default=4)
-    parser.add_argument("--cutouts", type=int, default=16, help="additional VQGAN-CLIP random cutouts per step")
+    parser.add_argument("--cutouts", type=int, default=4, help="additional VQGAN-CLIP random cutouts per step")
     parser.add_argument(
         "--gemma-batch-size",
         type=int,
@@ -669,7 +756,7 @@ def main():
         "--representation-distance",
         "--rep-distance",
         choices=["cosine", "spherical", "geodesic"],
-        default="spherical",
+        default="cosine",
         dest="representation_distance",
         help="distance used by the representation objective (default: cosine)",
     )
@@ -678,7 +765,7 @@ def main():
     parser.add_argument("--das-shift", type=int, default=DAS_SHIFT)
     parser.add_argument("--das-noise-std", type=float, default=DAS_NOISE_STD)
     parser.add_argument("--rep-weight", type=float, default=4.0)
-    parser.add_argument("--sentence-weight", type=float, default=0.15)
+    parser.add_argument("--sentence-weight", type=float, default=0)
     parser.add_argument("--commit-weight", type=float, default=0.02)
     parser.add_argument("--tv-weight", type=float, default=0.02)
     parser.add_argument("--latent-l2-weight", type=float, default=0)
@@ -691,7 +778,7 @@ def main():
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--out", default="output_vqgan_gemma_fear_codebook")
+    parser.add_argument("--out", default="output_vqgan_gemma_will")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -708,6 +795,9 @@ def main():
         sentence="",
         layer=args.layer,
         instruction=args.instruction,
+        baseline_pcs=args.baseline_pcs,
+        background_transform=args.background_transform,
+        whitening_ridge=args.whitening_ridge,
     )
 
     generator = VQGANGenerator(
@@ -744,6 +834,10 @@ def main():
     print(f"latent L2 decay  = {args.latent_l2_decay} per step")
     print(f"rep weight       = {args.rep_weight}")
     print(f"rep distance     = {args.representation_distance}")
+    print(f"background xform = {args.background_transform}")
+    if args.background_transform == "whitening":
+        print(f"whitening ridge  = {args.whitening_ridge}")
+    print(f"baseline PCs     = {args.baseline_pcs}")
     print(f"sentence weight  = {args.sentence_weight}")
     print(f"commit weight    = {args.commit_weight}")
     print(f"tv weight        = {args.tv_weight}")

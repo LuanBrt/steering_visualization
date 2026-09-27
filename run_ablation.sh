@@ -9,20 +9,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/ablation_vqgan_gemma}"
-STEPS="${STEPS:-900}"
+STEPS="${STEPS:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-300}"
 INIT_SCALE="${INIT_SCALE:-0.5}"
 LAYERS="${LAYERS:-1 8 16 24}"
 INIT_METHODS="${INIT_METHODS:-gaussian}"
 DISTANCES="${DISTANCES:-cosine}"
-CONCEPT_SET="${CONCEPT_SET:-abstract}" # concrete, abstract, or both
+CONCEPT_SET="${CONCEPT_SET:-both}" # concrete, abstract, or both
 DRY_RUN="${DRY_RUN:-0}"
 
 read -r -a LAYER_LIST <<< "$LAYERS"
 read -r -a INIT_LIST <<< "$INIT_METHODS"
 read -r -a DISTANCE_LIST <<< "$DISTANCES"
 
-CONCRETE_CONCEPTS=(castle volcano astronaut)
+CONCRETE_CONCEPTS=(giraffe castle volcano astronaut)
 ABSTRACT_CONCEPTS=(justice memory intelligence beauty chaos freedom )
 
 case "$CONCEPT_SET" in

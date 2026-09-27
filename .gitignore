@@ -8,3 +8,5 @@ ablation_*/
 .agents/
 .codex/
 __pycache__/
+
+word_experiment_vqgan_gemma/
