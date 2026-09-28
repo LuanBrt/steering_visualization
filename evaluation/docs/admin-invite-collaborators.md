@@ -1,5 +1,7 @@
 # Convidando colegas para o pipeline de avaliação (guia do admin)
 
+*(Tradução em inglês: [`admin-invite-collaborators.en.md`](admin-invite-collaborators.en.md))*
+
 Este guia é para você (o dono da conta AWS). Ele mostra como dar a um colega
 acesso para subir imagens, consultar o Athena e baixar resultados — sem dar
 acesso a mais nada na conta.
@@ -10,7 +12,14 @@ até você explicitamente autorizar cada usuário — isso é feito uma vez por
 colega, fora do CDK (de propósito: a lista de quem tem acesso não devia
 exigir redeploy de infraestrutura toda vez que alguém entra ou sai do time).
 
-- Role ARN: `arn:aws:iam::688591018409:role/steering-visualization-collaborator`
+Descubra o Account ID da sua conta de deploy (não gravamos esse número em
+nenhum arquivo do repositório, de propósito — ver seção 12 da spec):
+```bash
+aws sts get-caller-identity --profile <seu-profile> --query Account --output text
+```
+Nos comandos abaixo, `<ACCOUNT_ID>` é esse número.
+
+- Role ARN: `arn:aws:iam::<ACCOUNT_ID>:role/steering-visualization-collaborator`
 - Sessão dura até 12h (o máximo permitido) — colega não precisa reassumir o role toda hora.
 
 ## Passo 0 (uma vez só): criar o grupo que autoriza assumir o role
@@ -26,7 +35,7 @@ aws iam put-group-policy \
     "Statement": [{
       "Effect": "Allow",
       "Action": "sts:AssumeRole",
-      "Resource": "arn:aws:iam::688591018409:role/steering-visualization-collaborator"
+      "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/steering-visualization-collaborator"
     }]
   }'
 ```
@@ -52,9 +61,9 @@ aws iam create-login-profile \
   --password 'TrocarEssaSenha123!' \
   --password-reset-required
 ```
-Passe pra ela: o **Account ID** (`688591018409`), o usuário (`alice`) e essa
-senha temporária — ela troca no primeiro login em
-`https://688591018409.signin.aws.amazon.com/console`.
+Passe pra ela: o **Account ID** (o número que você pegou acima), o usuário
+(`alice`) e essa senha temporária — ela troca no primeiro login em
+`https://<ACCOUNT_ID>.signin.aws.amazon.com/console`.
 
 **Access key para linha de comando** (bom se ela vai usar o AWS CLI):
 ```bash
@@ -67,7 +76,7 @@ seguro (não por e-mail/Slack em texto puro). Essa é a única vez que a
 ## Passo 3: mandar pra ela
 
 - O **guia do colega**: `evaluation/docs/collaborator-guide.md`
-- O **Account ID**: `688591018409`
+- O **Account ID**: o número que você pegou no início deste guia
 - O **nome do role**: `steering-visualization-collaborator`
 - As credenciais do Passo 2
 

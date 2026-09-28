@@ -33,14 +33,19 @@ def group_by_concept(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
     return groups
 
 
-def plot(rows: list[dict], ci_method: str, output_path: Path) -> None:
+def plot(rows: list[dict], ci_method: str, output_path: Path, title: str | None = None) -> None:
     groups = group_by_concept(rows)
     concepts = sorted(groups.keys())
 
     n_cols = 3
     n_rows = -(-len(concepts) // n_cols)  # ceil division
+    # sharex=False on purpose: different concepts can have been tested at
+    # different layers (e.g. an older batch at 8/16/24 vs a newer one at
+    # 5/15/25). Sharing the x-axis would share tick positions/labels too --
+    # matplotlib applies whichever panel's set_xticks() ran last to the
+    # whole shared group -- silently mislabeling every other panel's axis.
     fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(3.1 * n_cols, 2.6 * n_rows), sharex=True, sharey=True,
+        n_rows, n_cols, figsize=(3.1 * n_cols, 2.6 * n_rows), sharex=False, sharey=True,
     )
     axes = axes.flatten()
 
@@ -74,7 +79,7 @@ def plot(rows: list[dict], ci_method: str, output_path: Path) -> None:
     fig.supxlabel("Layer", fontsize=11, color="#2b2b2b")
     fig.supylabel("Proportion recognised", fontsize=11, color="#2b2b2b")
     fig.suptitle(
-        f"Recognition rate by layer, per concept ({ci_method.capitalize()} 95% CI)",
+        title or f"Recognition rate by layer, per concept ({ci_method.capitalize()} 95% CI)",
         fontsize=12, color="#2b2b2b",
     )
     fig.tight_layout(rect=(0.03, 0.02, 1, 0.94))
@@ -87,10 +92,11 @@ def main() -> int:
     parser.add_argument("--csv", type=Path, default=_DEFAULT_CSV)
     parser.add_argument("--ci", choices=["wald", "wilson"], default="wald")
     parser.add_argument("--output", type=Path, default=_DEFAULT_OUTPUT)
+    parser.add_argument("--title", default=None)
     args = parser.parse_args()
 
     rows = load_rows(args.csv)
-    plot(rows, args.ci, args.output)
+    plot(rows, args.ci, args.output, title=args.title)
     return 0
 
 

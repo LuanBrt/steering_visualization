@@ -35,8 +35,11 @@ _PARTITION_KEYS = [
 ]
 
 _REGION = "us-east-1"
-# PROVISIONAL: swapped from GPT-5.6 Terra/Luna while the OpenAI model
-# agreement propagates on the account. Revert to:
+# PROVISIONAL: the original paper uses GPT-5/GPT-5-mini; the closest Bedrock
+# equivalent (openai.gpt-5.6-terra/luna) never got authorized on this account
+# despite accepting the model agreement (AccessDeniedException persisted for
+# hours after `authorizationStatus: AUTHORIZED`) -- see design spec section 4.
+# Swapped to Claude, which was immediately available. Revert to:
 #   _RECOGNITION_MODEL_ID = "us.openai.gpt-5.6-terra"
 #   _RECOGNITION_FOUNDATION_MODEL_ID = "openai.gpt-5.6-terra"
 #   _EVALUATION_MODEL_ID = "us.openai.gpt-5.6-luna"

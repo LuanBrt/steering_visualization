@@ -95,18 +95,34 @@ def upload_missing(
     return uploaded, already_present
 
 
+def discover_all_checkpoints(source_roots: list[Path]) -> list[Checkpoint]:
+    """Runs discover_checkpoints over every source root and concatenates the
+    results. Different colleagues/batches typically land in differently
+    named folders (e.g. a fresh "Resultados-<timestamp>/" export each time),
+    so this is how multiple such folders get combined into one upload pass.
+    A checkpoint's S3 key does not depend on which source root it came from
+    (only on its category/label/layer), so two sources describing the same
+    run just resolve to the same key -- upload_missing() already treats a
+    duplicate key as "already present" the second time it sees it, so no
+    special de-duplication is needed here."""
+    all_checkpoints: list[Checkpoint] = []
+    for source_root in source_roots:
+        all_checkpoints.extend(discover_checkpoints(source_root))
+    return all_checkpoints
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--source", type=Path, default=_DEFAULT_SOURCE,
-        help=f"Root of the local experiment output (default: {_DEFAULT_SOURCE})",
+        "--source", type=Path, nargs="+", default=[_DEFAULT_SOURCE],
+        help=f"One or more roots of local experiment output (default: {_DEFAULT_SOURCE})",
     )
     parser.add_argument("--bucket", default="steering-visualization")
     parser.add_argument("--profile", default=None, help="AWS CLI profile to use")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be uploaded without uploading")
     args = parser.parse_args()
 
-    checkpoints = discover_checkpoints(args.source)
+    checkpoints = discover_all_checkpoints(args.source)
     if not checkpoints:
         print(f"No {_CHECKPOINT_FILENAME} checkpoints found under {args.source}")
         return 0

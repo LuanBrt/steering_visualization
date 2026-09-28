@@ -1,22 +1,25 @@
 # Guia do colaborador — pipeline de avaliação steering-visualization
 
+*(Tradução em inglês: [`collaborator-guide.en.md`](collaborator-guide.en.md))*
+
 Você recebeu acesso pra subir imagens de teste, acompanhar os resultados
 automáticos e consultar tudo via SQL. Não é preciso saber nada de AWS além do
 que está aqui.
 
 ## 1. Configurar seu acesso
 
-Você deve ter recebido do dono da conta: um usuário/senha (ou access
-key), o **Account ID** (`688591018409`) e o nome do role
-(`steering-visualization-collaborator`).
+Você deve ter recebido do dono da conta: um usuário/senha (ou access key), o
+**Account ID** e o nome do role (`steering-visualization-collaborator`). Nos
+exemplos abaixo, `<ACCOUNT_ID>` é esse número que você recebeu (não é gravado
+neste guia de propósito, já que ele é público).
 
 ### Opção A — Console AWS (mais fácil pra explorar/consultar)
 
-1. Entre em `https://688591018409.signin.aws.amazon.com/console` com seu usuário e senha.
+1. Entre em `https://<ACCOUNT_ID>.signin.aws.amazon.com/console` com seu usuário e senha.
 2. No menu do canto superior direito, clique em **Switch Role** (ou acesse
    diretamente https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_switch-role-console.html
    se não achar o botão).
-3. Account: `688591018409`. Role: `steering-visualization-collaborator`.
+3. Account: `<ACCOUNT_ID>`. Role: `steering-visualization-collaborator`.
    Dê um nome de exibição se quiser (ex: "steering-viz").
 
 Depois disso, o console já vai te levar a S3 e Athena com o acesso certo.
@@ -35,7 +38,7 @@ aws_secret_access_key = <seu secret access key>
 region = us-east-1
 
 [profile steering-visualization]
-role_arn = arn:aws:iam::688591018409:role/steering-visualization-collaborator
+role_arn = arn:aws:iam::<ACCOUNT_ID>:role/steering-visualization-collaborator
 source_profile = alice
 region = us-east-1
 ```

@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 from botocore.exceptions import ClientError
 
-from upload_experiment_results import Checkpoint, discover_checkpoints, upload_missing
+from upload_experiment_results import Checkpoint, discover_all_checkpoints, discover_checkpoints, upload_missing
 
 
 def _make_run(tmp_path, category, label, layer, with_best=True, extra_files=()):
@@ -80,6 +80,21 @@ def test_upload_missing_skips_existing_and_uploads_new(tmp_path):
     assert uploaded == [missing]
     assert already_present == [existing]
     s3.upload_file.assert_called_once_with(str(missing.local_path), "steering-visualization", missing.s3_key)
+
+
+def test_discover_all_checkpoints_combines_multiple_source_roots(tmp_path):
+    root_a = tmp_path / "batch_a"
+    root_b = tmp_path / "batch_b"
+    _make_run(root_a, "Animals", "giraffe", "8")
+    _make_run(root_b, "Emotion_adjectives", "happy_person", "5")
+
+    checkpoints = discover_all_checkpoints([root_a, root_b])
+    keys = {c.s3_key for c in checkpoints}
+
+    assert keys == {
+        "data/layer_8/Animals/giraffe/0.png",
+        "data/layer_5/Emotion_adjectives/happy_person/0.png",
+    }
 
 
 def test_upload_missing_dry_run_never_calls_upload_file(tmp_path):
